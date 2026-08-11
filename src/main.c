@@ -10,9 +10,11 @@
 #ifdef __MINGW32__
 extern int __argc;
 extern char **__argv;
-int *__imp___argc;
-char ***__imp___argv;
+extern int ___argc;
+extern char ***___argv;
 __attribute__((constructor)) static void initImpArgv(void) {
+    extern int *__imp___argc;
+    extern char ***__imp___argv;
     __imp___argc = &__argc;
     __imp___argv = &__argv;
 }
@@ -24,20 +26,6 @@ typedef enum {
     HOTKEY_MODE_HOLD,
 } HotkeyMode;
 static HotkeyMode hotkeyMode = HOTKEY_MODE_TOGGLE;
-
-// the order decides which module get processed first
-Module* modules[MODULE_CNT] = {
-    &lagModule,
-    &dropModule,
-    &throttleModule,
-    &dupModule,
-    &oodModule,
-    &tamperModule,
-    &resetModule,
-	&bandwidthModule,
-};
-
-volatile short sendState = SEND_STATUS_NONE;
 
 // global iup handlers
 static Ihandle *dialog, *topFrame, *bottomFrame; 
@@ -83,6 +71,42 @@ UINT filtersSize;
 filterRecord filters[CONFIG_MAX_RECORDS] = {0};
 char configBuf[CONFIG_BUF_SIZE+2]; // add some padding to write \n
 BOOL parameterized = 0; // parameterized flag, means reading args from command line
+
+// save non-module settings (hotkey, mode, filter, preset selection)
+static void saveGlobalSettings(void) {
+    char buf[16];
+    int vk = hotkeyGetVk();
+    int selected = IupGetInt(filterSelectList, "VALUE");
+    const char *filterValue = IupGetAttribute(filterText, "VALUE");
+
+    sprintf(buf, "%d", vk);
+    settingsSet("hotkey-vk", buf);
+    sprintf(buf, "%d", hotkeyMode == HOTKEY_MODE_HOLD ? 1 : 0);
+    settingsSet("hotkey-mode", buf);
+
+    if (filterValue) {
+        settingsSet("filter", filterValue);
+    }
+    if (selected > 0 && selected <= (int)filtersSize) {
+        settingsSet("preset", filters[selected-1].filterName);
+    } else {
+        settingsSet("preset", "");
+    }
+}
+
+// the order decides which module get processed first
+Module* modules[MODULE_CNT] = {
+    &lagModule,
+    &dropModule,
+    &throttleModule,
+    &dupModule,
+    &oodModule,
+    &tamperModule,
+    &resetModule,
+	&bandwidthModule,
+};
+
+volatile short sendState = SEND_STATUS_NONE;
 
 // loading up filters and fill in
 void loadConfig() {
@@ -162,6 +186,9 @@ void init(int argc, char* argv[]) {
     // iup inits
     IupOpen(&argc, &argv);
 
+    // load saved settings into IUP globals (CLI args still take precedence)
+    settingsLoad();
+
     statusLabel = IupLabel("Ready. Select a preset, enable functions and click Start.");
     IupSetAttribute(statusLabel, "EXPAND", "HORIZONTAL");
     IupSetAttribute(statusLabel, "PADDING", "8x8");
@@ -212,10 +239,36 @@ void init(int argc, char* argv[]) {
         sprintf(ixBuf, "%d", ix+1); // staring from 1, following lua indexing
         IupStoreAttribute(filterSelectList, ixBuf, filters[ix].filterName);
     }
-    IupSetAttribute(filterSelectList, "VALUE", "1");
+    // restore saved preset selection and filter (if any)
+    {
+        const char *savedPreset = settingsGet("preset");
+        const char *savedFilter = settingsGet("filter");
+        int presetIdx = 0;
+        if (savedPreset && *savedPreset) {
+            for (ix = 0; ix < filtersSize; ++ix) {
+                if (strcmp(filters[ix].filterName, savedPreset) == 0) {
+                    presetIdx = ix + 1;
+                    break;
+                }
+            }
+        }
+        if (presetIdx > 0) {
+            IupSetInt(filterSelectList, "VALUE", presetIdx);
+            if (savedFilter && *savedFilter) {
+                IupSetAttribute(filterText, "VALUE", savedFilter);
+            } else {
+                IupSetAttribute(filterText, "VALUE", filters[presetIdx-1].filterValue);
+            }
+        } else if (savedFilter && *savedFilter && IupGetGlobal("filter") == NULL) {
+            IupSetAttribute(filterText, "VALUE", savedFilter);
+            IupSetAttribute(filterSelectList, "VALUE", "0");
+        } else {
+            IupSetAttribute(filterSelectList, "VALUE", "1");
+            // set filter text value since the callback wont take effect before main loop starts
+            IupSetAttribute(filterText, "VALUE", filters[0].filterValue);
+        }
+    }
     IupSetCallback(filterSelectList, "ACTION", (Icallback)uiListSelectCb);
-    // set filter text value since the callback wont take effect before main loop starts
-    IupSetAttribute(filterText, "VALUE", filters[0].filterValue);
 
     // hotkey frame
     hotkeyFrame = IupFrame(
@@ -229,10 +282,26 @@ void init(int argc, char* argv[]) {
             NULL
         )
     );
+    // restore saved hotkey vk and mode (CLI args are not used for these)
     {
-        char hotkeyNameBuf[64];
-        hotkeyGetName(hotkeyGetVk(), hotkeyNameBuf, sizeof(hotkeyNameBuf));
-        IupStoreAttribute(hotkeyText, "VALUE", hotkeyNameBuf);
+        const char *savedVk = settingsGet("hotkey-vk");
+        const char *savedMode = settingsGet("hotkey-mode");
+        if (savedVk && *savedVk) {
+            int vk = atoi(savedVk);
+            if (vk > 0) hotkeySetVk(vk);
+        }
+        if (savedMode && *savedMode) {
+            if (atoi(savedMode) == 1) {
+                hotkeyMode = HOTKEY_MODE_HOLD;
+                hotkeySetHoldMode(1);
+                IupSetAttribute(hotkeyModeButton, "TITLE", "Mode: Hold");
+            }
+        }
+        {
+            char hotkeyNameBuf[64];
+            hotkeyGetName(hotkeyGetVk(), hotkeyNameBuf, sizeof(hotkeyNameBuf));
+            IupStoreAttribute(hotkeyText, "VALUE", hotkeyNameBuf);
+        }
     }
     IupSetAttribute(hotkeyFrame, "TITLE", "Hotkey (Start/Stop)");
     IupSetAttribute(hotkeyText, "READONLY", "YES");
@@ -333,6 +402,9 @@ void startup() {
 
 void cleanup() {
 
+    // save hotkey/mode/filter settings before tearing down
+    saveGlobalSettings();
+
     IupDestroy(timer);
     IupDestroy(hotkeyTimer);
     if (timeout) {
@@ -340,6 +412,9 @@ void cleanup() {
     }
 
     hotkeyStop();
+
+    // save all module settings + global settings to settings.txt
+    settingsSave();
 
     IupClose();
     endTimePeriod(); // try close if not closing
@@ -644,10 +719,8 @@ static void uiSetupModule(Module *module, Ihandle *parent) {
     IupSetAttribute(icon, "PADDING", "4x");
     module->iconHandle = icon;
 
-    // parameterize toggle
-    if (parameterized) {
-        setFromParameter(toggle, "VALUE", module->shortName);
-    }
+    // apply saved enabled state (CLI args take precedence via IUP globals)
+    setFromParameter(toggle, "VALUE", module->shortName);
 }
 
 int main(int argc, char* argv[]) {
