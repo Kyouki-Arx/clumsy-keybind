@@ -6,7 +6,26 @@
 #include "iup.h"
 #include "common.h"
 
-// ! the order decides which module get processed first
+// mingw cuz why not
+#ifdef __MINGW32__
+extern int __argc;
+extern char **__argv;
+int *__imp___argc;
+char ***__imp___argv;
+__attribute__((constructor)) static void initImpArgv(void) {
+    __imp___argc = &__argc;
+    __imp___argv = &__argv;
+}
+#endif
+
+// hotkey toggle/hold mode
+typedef enum {
+    HOTKEY_MODE_TOGGLE,
+    HOTKEY_MODE_HOLD,
+} HotkeyMode;
+static HotkeyMode hotkeyMode = HOTKEY_MODE_TOGGLE;
+
+// the order decides which module get processed first
 Module* modules[MODULE_CNT] = {
     &lagModule,
     &dropModule,
@@ -29,6 +48,15 @@ Ihandle *filterSelectList;
 static Ihandle *stateIcon;
 static Ihandle *timer;
 static Ihandle *timeout = NULL;
+static Ihandle *hotkeyTimer;
+// hotkey ui
+static Ihandle *hotkeyFrame, *hotkeyText, *hotkeyButton, *hotkeyModeButton;
+static volatile short hotkeyActive = 0;
+static HWND dialogHwnd = NULL;
+static volatile short hotkeyPressed = 0;
+static volatile short hotkeyReleased = 0;
+static volatile short capturingHotkey = 0;
+static DWORD capturingStartTick = 0;
 
 void showStatus(const char *line);
 static int uiOnDialogShow(Ihandle *ih, int state);
@@ -38,6 +66,9 @@ static int uiTimerCb(Ihandle *ih);
 static int uiTimeoutCb(Ihandle *ih);
 static int uiListSelectCb(Ihandle *ih, char *text, int item, int state);
 static int uiFilterTextCb(Ihandle *ih);
+static int uiHotkeyButtonCb(Ihandle *ih);
+static int uiHotkeyModeButtonCb(Ihandle *ih);
+static int uiHotkeyTimerCb(Ihandle *ih);
 static void uiSetupModule(Module *module, Ihandle *parent);
 
 // serializing config files using a stupid custom format
@@ -131,9 +162,7 @@ void init(int argc, char* argv[]) {
     // iup inits
     IupOpen(&argc, &argv);
 
-    // this is so easy to get wrong so it's pretty worth noting in the program
-    statusLabel = IupLabel("NOTICE: When capturing localhost (loopback) packets, you CAN'T include inbound criteria.\n"
-        "Filters like 'udp' need to be 'udp and outbound' to work. See readme for more info.");
+    statusLabel = IupLabel("Ready. Select a preset, enable functions and click Start.");
     IupSetAttribute(statusLabel, "EXPAND", "HORIZONTAL");
     IupSetAttribute(statusLabel, "PADDING", "8x8");
 
@@ -152,9 +181,6 @@ void init(int argc, char* argv[]) {
         )
     );
 
-    // parse arguments and set globals *before* setting up UI.
-    // arguments can be read and set after callbacks are setup
-    // FIXME as Release is built as WindowedApp, stdout/stderr won't show
     LOG("argc: %d", argc);
     if (argc > 1) {
         if (!parseArgs(argc, argv)) {
@@ -183,17 +209,43 @@ void init(int argc, char* argv[]) {
     IupSetAttribute(filterSelectList, "DROPDOWN", "YES");
     for (ix = 0; ix < filtersSize; ++ix) {
         char ixBuf[4];
-        sprintf(ixBuf, "%d", ix+1); // ! staring from 1, following lua indexing
+        sprintf(ixBuf, "%d", ix+1); // staring from 1, following lua indexing
         IupStoreAttribute(filterSelectList, ixBuf, filters[ix].filterName);
     }
     IupSetAttribute(filterSelectList, "VALUE", "1");
     IupSetCallback(filterSelectList, "ACTION", (Icallback)uiListSelectCb);
-    // set filter text value since the callback won't take effect before main loop starts
+    // set filter text value since the callback wont take effect before main loop starts
     IupSetAttribute(filterText, "VALUE", filters[0].filterValue);
+
+    // hotkey frame
+    hotkeyFrame = IupFrame(
+        IupVbox(
+            hotkeyText = IupText(NULL),
+            IupHbox(
+                hotkeyButton = IupButton("Set Hotkey (press key)", NULL),
+                hotkeyModeButton = IupButton("Mode: Toggle", NULL),
+                NULL
+            ),
+            NULL
+        )
+    );
+    {
+        char hotkeyNameBuf[64];
+        hotkeyGetName(hotkeyGetVk(), hotkeyNameBuf, sizeof(hotkeyNameBuf));
+        IupStoreAttribute(hotkeyText, "VALUE", hotkeyNameBuf);
+    }
+    IupSetAttribute(hotkeyFrame, "TITLE", "Hotkey (Start/Stop)");
+    IupSetAttribute(hotkeyText, "READONLY", "YES");
+    IupSetAttribute(hotkeyText, "EXPAND", "HORIZONTAL");
+    IupSetAttribute(hotkeyButton, "PADDING", "8x");
+    IupSetAttribute(hotkeyModeButton, "PADDING", "8x");
+    IupSetCallback(hotkeyButton, "ACTION", (Icallback)uiHotkeyButtonCb);
+    IupSetCallback(hotkeyModeButton, "ACTION", (Icallback)uiHotkeyModeButtonCb);
 
     // functionalities frame 
     bottomFrame = IupFrame(
         bottomVbox = IupVbox(
+            hotkeyFrame,
             NULL
         )
     );
@@ -246,6 +298,15 @@ void init(int argc, char* argv[]) {
     IupSetAttribute(timer, "TIME", STR(ICON_UPDATE_MS));
     IupSetCallback(timer, "ACTION_CB", uiTimerCb);
 
+    // setup hotkey trigger timer (polls for hotkey activation on main thread)
+    hotkeyTimer = IupTimer();
+    IupSetAttribute(hotkeyTimer, "TIME", "50");
+    IupSetCallback(hotkeyTimer, "ACTION_CB", (Icallback)uiHotkeyTimerCb);
+    IupSetAttribute(hotkeyTimer, "RUN", "YES");
+
+    // start hotkey thread
+    hotkeyStart();
+
     // setup timeout of program
     arg_value = IupGetGlobal("timeout");
     if(arg_value != NULL)
@@ -273,9 +334,12 @@ void startup() {
 void cleanup() {
 
     IupDestroy(timer);
+    IupDestroy(hotkeyTimer);
     if (timeout) {
         IupDestroy(timeout);
     }
+
+    hotkeyStop();
 
     IupClose();
     endTimePeriod(); // try close if not closing
@@ -453,6 +517,31 @@ static int uiTimeoutCb(Ihandle *ih) {
     return IUP_CLOSE;
  }
 
+static void hotkeyToggle(void) {
+    // toggle filtering like the Start/Stop button
+    if (divertGetState()) {
+        uiStopCb(filterButton);
+    } else {
+        uiStartCb(filterButton);
+    }
+}
+
+static int uiHotkeyModeButtonCb(Ihandle *ih) {
+    UNREFERENCED_PARAMETER(ih);
+    // switch mode
+    if (hotkeyMode == HOTKEY_MODE_TOGGLE) {
+        hotkeyMode = HOTKEY_MODE_HOLD;
+        hotkeySetHoldMode(1);
+        IupSetAttribute(hotkeyModeButton, "TITLE", "Mode: Hold");
+    } else {
+        hotkeyMode = HOTKEY_MODE_TOGGLE;
+        hotkeySetHoldMode(0);
+        IupSetAttribute(hotkeyModeButton, "TITLE", "Mode: Toggle");
+    }
+    hotkeyRestart(); // re-register hotkey with new mode
+    return IUP_DEFAULT;
+}
+
 static int uiListSelectCb(Ihandle *ih, char *text, int item, int state) {
     UNREFERENCED_PARAMETER(text);
     UNREFERENCED_PARAMETER(ih);
@@ -466,6 +555,66 @@ static int uiFilterTextCb(Ihandle *ih)  {
     UNREFERENCED_PARAMETER(ih);
     // unselect list
     IupSetAttribute(filterSelectList, "VALUE", "0");
+    return IUP_DEFAULT;
+}
+
+static int uiHotkeyButtonCb(Ihandle *ih) {
+    UNREFERENCED_PARAMETER(ih);
+    // enter capture mode: next key press sets hotkey
+    capturingHotkey = 1;
+    capturingStartTick = GetTickCount();
+    IupSetAttribute(hotkeyButton, "TITLE", "Press any key...");
+    IupSetAttribute(hotkeyText, "VALUE", "");
+    return IUP_DEFAULT;
+}
+
+
+static int uiHotkeyTimerCb(Ihandle *ih) {
+    int vk;
+    UNREFERENCED_PARAMETER(ih);
+
+    // if capturing hotkey, poll for the next key press
+    if (capturingHotkey) {
+        // skip a short moment so a key held from before capture
+        // doesnt get picked up immediately
+        if (GetTickCount() - capturingStartTick > 200) {
+            for (vk = 0x08; vk <= 0xFE; ++vk) {
+                if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+                    vk == VK_LWIN || vk == VK_RWIN)
+                    continue;
+                if (GetAsyncKeyState(vk) & 0x8000) {
+                    char hotkeyNameBuf[64];
+                    capturingHotkey = 0;
+                    hotkeySetVk(vk);
+                    hotkeyRestart();
+                    hotkeyGetName(vk, hotkeyNameBuf, sizeof(hotkeyNameBuf));
+                    IupStoreAttribute(hotkeyText, "VALUE", hotkeyNameBuf);
+                    IupSetAttribute(hotkeyButton, "TITLE", "Set Hotkey (press key)");
+                    break;
+                }
+            }
+        }
+    }
+
+    // consume hotkey events directly from the hotkey thread (no window messaging)
+    if (hotkeyConsumePress()) {
+        showStatus("Hotkey pressed");
+        if (hotkeyMode == HOTKEY_MODE_TOGGLE) {
+            hotkeyToggle();
+        } else {
+            if (!divertGetState()) {
+                uiStartCb(filterButton);
+            }
+        }
+    }
+    if (hotkeyConsumeRelease()) {
+        if (hotkeyMode == HOTKEY_MODE_HOLD) {
+            // release stops filtering
+            if (divertGetState()) {
+                uiStopCb(filterButton);
+            }
+        }
+    }
     return IUP_DEFAULT;
 }
 

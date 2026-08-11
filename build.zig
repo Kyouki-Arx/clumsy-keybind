@@ -109,7 +109,7 @@ pub fn build(b: *std.build.Builder) void {
     exe.addCSourceFile("src/tamper.c", &.{""});
     exe.addCSourceFile("src/throttle.c", &.{""});
     exe.addCSourceFile("src/utils.c", &.{""});
-    exe.addCSourceFile("src/utils.c", &.{""});
+    exe.addCSourceFile("src/hotkey.c", &.{""});
 
     if (arch == .x86)
         exe.addCSourceFile("etc/chkstk.s", &.{""});

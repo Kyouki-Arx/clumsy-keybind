@@ -77,6 +77,10 @@ void dumpPacket(char *buf, int len, PWINDIVERT_ADDRESS paddr) {
 #define dumpPacket(x, y, z)
 #endif
 
+int divertGetState(void) {
+    return divertHandle != INVALID_HANDLE_VALUE && divertHandle != NULL;
+}
+
 int divertStart(const char *filter, char buf[]) {
     int ix;
 
@@ -392,6 +396,7 @@ void divertStop() {
     LOG("Stopping...");
     InterlockedIncrement16(&stopLooping);
     WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+    divertHandle = NULL;
 
     LOG("Successfully waited threads and stopped.");
 }

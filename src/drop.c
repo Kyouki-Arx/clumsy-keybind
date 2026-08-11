@@ -11,6 +11,11 @@ static volatile short dropEnabled = 0,
     dropInbound = 1, dropOutbound = 1,
     chance = 1000; // [0-10000]
 
+void dropSetEnabled(short enabled) { dropEnabled = enabled; }
+void dropSetInbound(short inbound) { dropInbound = inbound; }
+void dropSetOutbound(short outbound) { dropOutbound = outbound; }
+void dropSetChance(short c) { chance = c; }
+
 
 static Ihandle* dropSetupUI() {
     Ihandle *dropControlsBox = IupHbox(

@@ -148,6 +148,12 @@ extern Module resetModule;
 extern Module bandwidthModule;
 extern Module* modules[MODULE_CNT]; // all modules in a list
 
+// drop module setters (used by quick drop hotkey)
+void dropSetEnabled(short enabled);
+void dropSetInbound(short inbound);
+void dropSetOutbound(short outbound);
+void dropSetChance(short c);
+
 // status for sending packets, 
 #define SEND_STATUS_NONE 0
 #define SEND_STATUS_SEND 1
@@ -161,6 +167,7 @@ void showStatus(const char* line);
 // WinDivert
 int divertStart(const char * filter, char buf[]);
 void divertStop();
+int divertGetState(void);
 
 // utils
 // STR to convert int macro to string
@@ -185,6 +192,18 @@ void endTimePeriod();
 BOOL IsElevated();
 BOOL IsRunAsAdmin();
 BOOL tryElevate(HWND hWnd, BOOL silent);
+
+// hotkey
+void hotkeyStart();
+void hotkeyStop();
+void hotkeyRestart();
+void hotkeySetHoldMode(short hold);
+short hotkeyConsumePress(void);
+short hotkeyConsumeRelease(void);
+int hotkeyGetVk(void);
+void hotkeySetVk(int vk);
+UINT hotkeyGetId(void);
+void hotkeyGetName(int vk, char *buf, int bufsize);
 
 // icons
 extern const unsigned char icon8x8[8*8];
