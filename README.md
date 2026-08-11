@@ -21,6 +21,8 @@ Simulate network latency, delay, packet loss with clumsy on Windows 7/8/10:
 ![](clumsy-demo.gif)
 
 
+![](clumsy-keybind.png)
+
 ## License
 
 MIT
